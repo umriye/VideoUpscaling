@@ -1,0 +1,19 @@
+[project]
+name = "video-upscaling-pipeline"
+version = "1.0.0"
+description = "AI Video Upscaling Pipeline: SD → HD menggunakan Real-ESRGAN + HEVC + VMAF"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.6.0",
+    "pandas>=2.0.0",
+    "jinja2>=3.1.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+video-upscaling-gui = "run_gui:main"
+video-upscaling-cli = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

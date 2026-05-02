@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific (output, temp, large files)
+output/*
+!output/.gitkeep
+temp/*
+!temp/.gitkeep
+reports/*
+!reports/.gitkeep
+input/*
+!input/.gitkeep
+models/*
+!models/.gitkeep
+tools/realesrgan-ncnn-vulkan*
+tools/*.zip
+
+# Lock files (optional - uncomment jika ingin include uv.lock)
+# uv.lock
+
+# Logs
+*.log
+pipeline.log
+
