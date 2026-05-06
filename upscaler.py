@@ -317,13 +317,20 @@ class Upscaler:
         )
         logger.debug(f"Avg input frame size: {avg_in_size/1024:.0f} KB")
 
+        # Ukuran batch ESRGAN: proses max N frame per panggilan binary.
+        # Memproses terlalu banyak frame sekaligus (~300+) menyebabkan GPU/Vulkan
+        # menghasilkan output hitam (all-zero) meski exit code = 0.
+        # Nilai 30 terbukti aman; 20 frame juga dikonfirmasi bekerja.
+        ESRGAN_BATCH_SIZE = 30
+
         # ── Helper functions ───────────────────────────────────────────────
 
-        def _build_cmd(gpu_flag: str, tile: str, low_mem: bool = False) -> list:
+        def _build_cmd(gpu_flag: str, tile: str, low_mem: bool = False,
+                       inp: Path | None = None, out: Path | None = None) -> list:
             cmd = [
                 str(binary),
-                "-i", str(input_dir),
-                "-o", str(output_dir),
+                "-i", str(inp if inp is not None else input_dir),
+                "-o", str(out if out is not None else output_dir),
                 "-n", model,
                 "-s", scale,
                 "-t", tile,
@@ -450,81 +457,141 @@ class Upscaler:
 
         def _try_gpu(gpu_id: int, label: str, tile: str, low_mem: bool = False) -> str:
             """
-            Coba satu GPU dengan tile_size tertentu.
+            Coba satu GPU dengan tile_size tertentu, menggunakan batch processing.
+            Memproses semua frame dalam batch kecil (ESRGAN_BATCH_SIZE) untuk
+            menghindari bug GPU/Vulkan yang menghasilkan output hitam pada batch besar.
             Returns: _OK | _HARD_FAIL | _SIGSEGV | _BLANK
             """
             mem_tag = " [low-mem]" if low_mem else ""
-            self._log(f"[ESRGAN] Mencoba {label} (tile={tile}{mem_tag})...")
-            cmd = _build_cmd(str(gpu_id), tile, low_mem=low_mem)
-            logger.debug(f"CMD: {' '.join(cmd)}")
-
-            # Gunakan Popen untuk menampilkan progress real-time (ESRGAN output "X.XX%")
-            proc_obj = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+            n_batches = max(1, (len(in_frames) + ESRGAN_BATCH_SIZE - 1) // ESRGAN_BATCH_SIZE)
+            self._log(
+                f"[ESRGAN] Mencoba {label} (tile={tile}{mem_tag}, "
+                f"{n_batches} batch × ≤{ESRGAN_BATCH_SIZE} frame)..."
             )
-            stdout_lines: list[str] = []
-            last_pct = [-1]
+
+            # Buat direktori batch sementara di dalam tempdir yang sama
+            batch_in  = input_dir.parent / "_batch_in"
+            batch_out = input_dir.parent / "_batch_out"
+            batch_in.mkdir(exist_ok=True)
+            batch_out.mkdir(exist_ok=True)
+
+            content_threshold = max(100 * 1024, avg_in_size * 1.5)
+
             try:
-                for line in proc_obj.stdout:  # type: ignore[union-attr]
-                    line = line.rstrip()
-                    stdout_lines.append(line)
-                    # Tampiilkan persentase kemajuan setiap 10%
-                    try:
-                        pct = int(float(line.strip().replace("%", "")))
-                        if pct != last_pct[0] and pct % 10 == 0:
-                            self._log(f"[ESRGAN]   {label}: {pct}%")
-                            last_pct[0] = pct
-                    except (ValueError, AttributeError):
-                        pass
-            except Exception:
-                pass
-            proc_obj.wait()
+                for batch_idx in range(n_batches):
+                    start = batch_idx * ESRGAN_BATCH_SIZE
+                    batch_frames = sorted(in_frames)[start: start + ESRGAN_BATCH_SIZE]
 
-            # Buat objek yang kompatibel dengan kode lama
-            all_output = "\n".join(stdout_lines)
-            _rc = proc_obj.returncode
+                    # Bersihkan dan isi batch_in
+                    for f in batch_in.glob("*.png"):
+                        f.unlink(missing_ok=True)
+                    for f in batch_frames:
+                        shutil.copy2(f, batch_in / f.name)
 
-            class _ProcResult:
-                returncode = _rc
-                stderr = all_output
-                stdout = ""
-            proc = _ProcResult()
+                    # Bersihkan batch_out
+                    for f in batch_out.glob("*.png"):
+                        f.unlink(missing_ok=True)
 
-            # SIGSEGV (exit=-11) → kemungkinan OOM, coba tile lebih kecil
-            if proc.returncode == -11:
-                self._log(f"[ESRGAN] ✗ {label} crash (SIGSEGV/OOM, tile={tile})")
-                _clean_output()
-                return _SIGSEGV
+                    cmd = _build_cmd(str(gpu_id), tile, low_mem=low_mem,
+                                     inp=batch_in, out=batch_out)
+                    logger.debug(f"CMD[batch {batch_idx+1}/{n_batches}]: {' '.join(cmd)}")
 
-            if proc.returncode != 0 or _has_gpu_error(proc.stderr, proc.stdout):
-                reason = (
-                    "Vulkan/GPU error"
-                    if _has_gpu_error(proc.stderr, proc.stdout)
-                    else f"exit={proc.returncode}"
-                )
-                self._log(f"[ESRGAN] ✗ {label} gagal ({reason})")
-                last_lines = [
-                    l for l in proc.stderr.strip().splitlines()
-                    if l.strip() and not l.startswith("[")
-                ]
-                if last_lines:
-                    logger.debug(f"  stderr: {last_lines[-1]}")
-                _clean_output()
-                return _HARD_FAIL
-
-            if not _output_ok(output_dir):
-                # _output_ok sudah log pesan detail; tambahkan ukuran file sebagai info tambahan
-                out_frames = list(output_dir.glob("*.png"))
-                if out_frames and not any("Resolusi output" in msg for msg in [""]):
-                    avg_out = sum(f.stat().st_size for f in out_frames) / len(out_frames)
-                    logger.debug(
-                        f"  avg output size: {avg_out/1024:.0f}KB "
-                        f"(threshold: {avg_in_size*2/1024:.0f}KB)"
+                    # Jalankan ESRGAN dengan live progress
+                    proc_obj = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
                     )
+                    stdout_lines: list[str] = []
+                    last_pct = [-1]
+                    try:
+                        for line in proc_obj.stdout:  # type: ignore[union-attr]
+                            line = line.rstrip()
+                            stdout_lines.append(line)
+                            try:
+                                pct = int(float(line.strip().replace("%", "")))
+                                if pct != last_pct[0] and pct % 10 == 0:
+                                    self._log(
+                                        f"[ESRGAN]   {label} "
+                                        f"[{batch_idx+1}/{n_batches}]: {pct}%"
+                                    )
+                                    last_pct[0] = pct
+                            except (ValueError, AttributeError):
+                                pass
+                    except Exception:
+                        pass
+                    proc_obj.wait()
+
+                    all_output = "\n".join(stdout_lines)
+                    rc = proc_obj.returncode
+
+                    # SIGSEGV (exit=-11)
+                    if rc == -11:
+                        self._log(
+                            f"[ESRGAN] ✗ {label} crash "
+                            f"(SIGSEGV/OOM, tile={tile}, batch {batch_idx+1})"
+                        )
+                        _clean_output()
+                        return _SIGSEGV
+
+                    # Error Vulkan / exit code selain 0
+                    if rc != 0 or _has_gpu_error(all_output, ""):
+                        reason = (
+                            "Vulkan/GPU error"
+                            if _has_gpu_error(all_output, "")
+                            else f"exit={rc}"
+                        )
+                        self._log(
+                            f"[ESRGAN] ✗ {label} gagal "
+                            f"({reason}, batch {batch_idx+1})"
+                        )
+                        logger.debug(
+                            f"  stderr tail: "
+                            f"{all_output.strip().splitlines()[-1] if all_output.strip() else ''}"
+                        )
+                        _clean_output()
+                        return _HARD_FAIL
+
+                    # Periksa output batch — jumlah frame
+                    batch_outs = list(batch_out.glob("*.png"))
+                    if len(batch_outs) != len(batch_frames):
+                        self._log(
+                            f"[ESRGAN] ✗ Batch {batch_idx+1}: "
+                            f"jumlah frame output {len(batch_outs)} ≠ input {len(batch_frames)}"
+                        )
+                        _clean_output()
+                        return _BLANK
+
+                    # Periksa output batch — konten tidak hitam
+                    batch_avg = (
+                        sum(f.stat().st_size for f in batch_outs) / len(batch_outs)
+                    )
+                    if avg_in_size > 0 and batch_avg < content_threshold:
+                        self._log(
+                            f"[ESRGAN] ✗ Batch {batch_idx+1} terdeteksi hitam/kosong "
+                            f"(avg={batch_avg/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB)"
+                        )
+                        _clean_output()
+                        return _BLANK
+
+                    # Pindahkan output batch ke output_dir utama
+                    for f in batch_outs:
+                        shutil.move(str(f), output_dir / f.name)
+
+                    logger.debug(
+                        f"Batch {batch_idx+1}/{n_batches}: "
+                        f"{len(batch_frames)} frame, "
+                        f"avg {batch_avg/1024:.0f}KB ✓"
+                    )
+
+            finally:
+                shutil.rmtree(batch_in,  ignore_errors=True)
+                shutil.rmtree(batch_out, ignore_errors=True)
+
+            # Verifikasi akhir seluruh output
+            if not _output_ok(output_dir):
                 _clean_output()
                 return _BLANK
 
