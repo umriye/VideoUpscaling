@@ -372,6 +372,77 @@ class Upscaler:
             except Exception:
                 return None
 
+        def _is_output_blank(png_path: Path, sample_rows: int = 10) -> bool:
+            """
+            Baca beberapa baris piksel dari PNG untuk mengecek apakah output benar-benar blank.
+            Menggunakan zlib decompression langsung untuk menghindari dependency PIL/numpy.
+            Jika semua piksel yang disample identik (semua hitam/sama), return True (blank).
+            Fallback ke ukuran file jika parse gagal.
+            """
+            try:
+                import struct as _st, zlib as _zl
+                with open(png_path, "rb") as f:
+                    raw = f.read()
+                # Parse PNG chunks untuk mendapatkan IHDR dan IDAT
+                if raw[:8] != b"\x89PNG\r\n\x1a\n":
+                    return True  # Bukan PNG → anggap blank
+                pos = 8
+                width = height = bit_depth = color_type = 0
+                idat_chunks: list[bytes] = []
+                while pos < len(raw) - 12:
+                    length = _st.unpack(">I", raw[pos:pos+4])[0]
+                    ctype  = raw[pos+4:pos+8]
+                    data   = raw[pos+8:pos+8+length]
+                    if ctype == b"IHDR":
+                        width, height = _st.unpack(">II", data[:8])
+                        bit_depth, color_type = data[8], data[9]
+                    elif ctype == b"IDAT":
+                        idat_chunks.append(data)
+                    elif ctype == b"IEND":
+                        break
+                    pos += 12 + length
+                if not idat_chunks or width == 0:
+                    return True  # Parse gagal
+                # Channels: 3=RGB, 2=grayscale+alpha, 6=RGBA
+                channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type, 3)
+                bytes_per_pixel = channels * (bit_depth // 8)
+                stride = 1 + width * bytes_per_pixel  # +1 untuk filter byte
+                # Decompress sedikit data saja (streaming)
+                decomp = _zl.decompressobj()
+                buf = b""
+                rows_sampled = 0
+                unique_vals: set[bytes] = set()
+                for chunk in idat_chunks:
+                    buf += decomp.decompress(chunk)
+                    while len(buf) >= stride and rows_sampled < sample_rows:
+                        row = buf[1:stride]  # skip filter byte
+                        buf = buf[stride:]
+                        # Sample 3 piksel dari kiri, tengah, kanan
+                        mid = (width // 2) * bytes_per_pixel
+                        samples = [
+                            row[:bytes_per_pixel],
+                            row[mid:mid+bytes_per_pixel],
+                            row[-bytes_per_pixel:],
+                        ]
+                        for s in samples:
+                            unique_vals.add(s)
+                        rows_sampled += 1
+                        if rows_sampled >= sample_rows:
+                            break
+                    if rows_sampled >= sample_rows:
+                        break
+                if rows_sampled == 0:
+                    return True  # Tidak bisa baca baris → anggap blank
+                # Jika semua sample identik (misalnya semua hitam), ini blank
+                return len(unique_vals) <= 1
+            except Exception as _e:
+                logger.debug(f"_is_output_blank error: {_e}")
+                # Fallback: gunakan ukuran file — jika < 200KB untuk output 4× upscale → blank
+                try:
+                    return png_path.stat().st_size < 200 * 1024
+                except Exception:
+                    return True
+
         def _output_ok(out_dir: Path) -> bool:
             """
             Cek frame output valid menggunakan tiga kriteria:
@@ -417,17 +488,21 @@ class Upscaler:
                             return False
 
                         # Dimensi OK — verifikasi konten bukan hitam/kosong.
-                        # Frame hitam 2880×1920 PNG ≈ 5–50 KB (sangat kompres).
-                        # Frame nyata 2880×1920 PNG >> ukuran frame input (720×480).
-                        # Threshold konservatif: max(100KB, 1.5× rata-rata ukuran frame input).
+                        # Gunakan pixel-level check untuk konfirmasi.
                         content_threshold = max(100 * 1024, avg_in_size * 1.5)
                         if avg_in_size > 0 and avg_out < content_threshold:
-                            self._log(
-                                f"[ESRGAN] ✗ Frame output terdeteksi hitam/kosong "
-                                f"(avg={avg_out/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB) — "
-                                f"kemungkinan bug GPU/Vulkan, akan mencoba GPU/tile lain"
-                            )
-                            return False
+                            # Konfirmasi dengan pixel check
+                            if _is_output_blank(sample_out):
+                                self._log(
+                                    f"[ESRGAN] ✗ Frame output terdeteksi hitam/kosong "
+                                    f"(avg={avg_out/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB) — "
+                                    f"kemungkinan bug GPU/Vulkan, akan mencoba GPU/tile lain"
+                                )
+                                return False
+                            else:
+                                logger.debug(
+                                    f"Size check failed ({avg_out/1024:.0f}KB) tapi pixel check OK, output diterima"
+                                )
 
                         logger.debug(
                             f"Resolusi output {out_w}×{out_h} ✓, "
@@ -569,12 +644,22 @@ class Upscaler:
                         sum(f.stat().st_size for f in batch_outs) / len(batch_outs)
                     )
                     if avg_in_size > 0 and batch_avg < content_threshold:
-                        self._log(
-                            f"[ESRGAN] ✗ Batch {batch_idx+1} terdeteksi hitam/kosong "
-                            f"(avg={batch_avg/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB)"
-                        )
-                        _clean_output()
-                        return _BLANK
+                        # Verifikasi pixel-level: baca beberapa baris dari tengah PNG
+                        # untuk konfirmasi apakah benar-benar hitam/kosong
+                        truly_blank = _is_output_blank(batch_outs[0])
+                        if not truly_blank:
+                            # Output kecil tapi punya konten – threshold terlalu ketat, lanjutkan
+                            logger.debug(
+                                f"Batch {batch_idx+1}: size check failed ({batch_avg/1024:.0f}KB < "
+                                f"{content_threshold/1024:.0f}KB) tapi pixel check OK, lanjutkan"
+                            )
+                        else:
+                            self._log(
+                                f"[ESRGAN] ✗ Batch {batch_idx+1} terdeteksi hitam/kosong "
+                                f"(avg={batch_avg/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB)"
+                            )
+                            _clean_output()
+                            return _BLANK
 
                     # Pindahkan output batch ke output_dir utama
                     for f in batch_outs:
