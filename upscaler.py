@@ -551,115 +551,136 @@ class Upscaler:
             batch_out.mkdir(exist_ok=True)
 
             content_threshold = max(100 * 1024, avg_in_size * 1.5)
+            MAX_BLANK_RETRY = 2  # Retry batch blank hingga N kali sebelum ganti GPU
 
             try:
                 for batch_idx in range(n_batches):
                     start = batch_idx * ESRGAN_BATCH_SIZE
                     batch_frames = sorted(in_frames)[start: start + ESRGAN_BATCH_SIZE]
 
-                    # Bersihkan dan isi batch_in
-                    for f in batch_in.glob("*.png"):
-                        f.unlink(missing_ok=True)
-                    for f in batch_frames:
-                        shutil.copy2(f, batch_in / f.name)
+                    # ── Retry loop untuk batch blank (transient GPU/Vulkan issue) ──
+                    batch_outs: list[Path] = []
+                    batch_avg: float = 0.0
+                    for blank_attempt in range(MAX_BLANK_RETRY + 1):
+                        # Bersihkan dan isi batch_in
+                        for f in batch_in.glob("*.png"):
+                            f.unlink(missing_ok=True)
+                        for f in batch_frames:
+                            shutil.copy2(f, batch_in / f.name)
 
-                    # Bersihkan batch_out
-                    for f in batch_out.glob("*.png"):
-                        f.unlink(missing_ok=True)
+                        # Bersihkan batch_out
+                        for f in batch_out.glob("*.png"):
+                            f.unlink(missing_ok=True)
 
-                    cmd = _build_cmd(str(gpu_id), tile, low_mem=low_mem,
-                                     inp=batch_in, out=batch_out)
-                    logger.debug(f"CMD[batch {batch_idx+1}/{n_batches}]: {' '.join(cmd)}")
-
-                    # Jalankan ESRGAN dengan live progress
-                    proc_obj = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                    )
-                    stdout_lines: list[str] = []
-                    last_pct = [-1]
-                    try:
-                        for line in proc_obj.stdout:  # type: ignore[union-attr]
-                            line = line.rstrip()
-                            stdout_lines.append(line)
-                            try:
-                                pct = int(float(line.strip().replace("%", "")))
-                                if pct != last_pct[0] and pct % 10 == 0:
-                                    self._log(
-                                        f"[ESRGAN]   {label} "
-                                        f"[{batch_idx+1}/{n_batches}]: {pct}%"
-                                    )
-                                    last_pct[0] = pct
-                            except (ValueError, AttributeError):
-                                pass
-                    except Exception:
-                        pass
-                    proc_obj.wait()
-
-                    all_output = "\n".join(stdout_lines)
-                    rc = proc_obj.returncode
-
-                    # SIGSEGV (exit=-11)
-                    if rc == -11:
-                        self._log(
-                            f"[ESRGAN] ✗ {label} crash "
-                            f"(SIGSEGV/OOM, tile={tile}, batch {batch_idx+1})"
-                        )
-                        _clean_output()
-                        return _SIGSEGV
-
-                    # Error Vulkan / exit code selain 0
-                    if rc != 0 or _has_gpu_error(all_output, ""):
-                        reason = (
-                            "Vulkan/GPU error"
-                            if _has_gpu_error(all_output, "")
-                            else f"exit={rc}"
-                        )
-                        self._log(
-                            f"[ESRGAN] ✗ {label} gagal "
-                            f"({reason}, batch {batch_idx+1})"
-                        )
+                        cmd = _build_cmd(str(gpu_id), tile, low_mem=low_mem,
+                                         inp=batch_in, out=batch_out)
                         logger.debug(
-                            f"  stderr tail: "
-                            f"{all_output.strip().splitlines()[-1] if all_output.strip() else ''}"
+                            f"CMD[batch {batch_idx+1}/{n_batches}, "
+                            f"attempt {blank_attempt+1}]: {' '.join(cmd)}"
                         )
-                        _clean_output()
-                        return _HARD_FAIL
 
-                    # Periksa output batch — jumlah frame
-                    batch_outs = list(batch_out.glob("*.png"))
-                    if len(batch_outs) != len(batch_frames):
-                        self._log(
-                            f"[ESRGAN] ✗ Batch {batch_idx+1}: "
-                            f"jumlah frame output {len(batch_outs)} ≠ input {len(batch_frames)}"
+                        # Jalankan ESRGAN dengan live progress
+                        proc_obj = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
                         )
-                        _clean_output()
-                        return _BLANK
+                        stdout_lines: list[str] = []
+                        last_pct = [-1]
+                        try:
+                            for line in proc_obj.stdout:  # type: ignore[union-attr]
+                                line = line.rstrip()
+                                stdout_lines.append(line)
+                                try:
+                                    pct = int(float(line.strip().replace("%", "")))
+                                    if pct != last_pct[0] and pct % 10 == 0:
+                                        self._log(
+                                            f"[ESRGAN]   {label} "
+                                            f"[{batch_idx+1}/{n_batches}]: {pct}%"
+                                        )
+                                        last_pct[0] = pct
+                                except (ValueError, AttributeError):
+                                    pass
+                        except Exception:
+                            pass
+                        proc_obj.wait()
 
-                    # Periksa output batch — konten tidak hitam
-                    batch_avg = (
-                        sum(f.stat().st_size for f in batch_outs) / len(batch_outs)
-                    )
-                    if avg_in_size > 0 and batch_avg < content_threshold:
-                        # Verifikasi pixel-level: baca beberapa baris dari tengah PNG
-                        # untuk konfirmasi apakah benar-benar hitam/kosong
-                        truly_blank = _is_output_blank(batch_outs[0])
-                        if not truly_blank:
-                            # Output kecil tapi punya konten – threshold terlalu ketat, lanjutkan
-                            logger.debug(
-                                f"Batch {batch_idx+1}: size check failed ({batch_avg/1024:.0f}KB < "
-                                f"{content_threshold/1024:.0f}KB) tapi pixel check OK, lanjutkan"
+                        all_output = "\n".join(stdout_lines)
+                        rc = proc_obj.returncode
+
+                        # SIGSEGV (exit=-11) — tidak di-retry
+                        if rc == -11:
+                            self._log(
+                                f"[ESRGAN] ✗ {label} crash "
+                                f"(SIGSEGV/OOM, tile={tile}, batch {batch_idx+1})"
                             )
-                        else:
+                            _clean_output()
+                            return _SIGSEGV
+
+                        # Error Vulkan / exit code selain 0 — tidak di-retry
+                        if rc != 0 or _has_gpu_error(all_output, ""):
+                            reason = (
+                                "Vulkan/GPU error"
+                                if _has_gpu_error(all_output, "")
+                                else f"exit={rc}"
+                            )
+                            self._log(
+                                f"[ESRGAN] ✗ {label} gagal "
+                                f"({reason}, batch {batch_idx+1})"
+                            )
+                            logger.debug(
+                                f"  stderr tail: "
+                                f"{all_output.strip().splitlines()[-1] if all_output.strip() else ''}"
+                            )
+                            _clean_output()
+                            return _HARD_FAIL
+
+                        # Periksa jumlah frame output
+                        batch_outs = list(batch_out.glob("*.png"))
+                        if len(batch_outs) != len(batch_frames):
+                            if blank_attempt < MAX_BLANK_RETRY:
+                                self._log(
+                                    f"[ESRGAN]   Retry {blank_attempt+1}/{MAX_BLANK_RETRY}: "
+                                    f"jumlah frame output {len(batch_outs)} ≠ {len(batch_frames)}"
+                                )
+                                import time as _time; _time.sleep(2)
+                                continue  # coba lagi
+                            self._log(
+                                f"[ESRGAN] ✗ Batch {batch_idx+1}: "
+                                f"jumlah frame output {len(batch_outs)} ≠ input {len(batch_frames)}"
+                            )
+                            _clean_output()
+                            return _BLANK
+
+                        # Periksa konten — bukan hitam/kosong
+                        batch_avg = (
+                            sum(f.stat().st_size for f in batch_outs) / len(batch_outs)
+                        )
+                        truly_blank = (
+                            avg_in_size > 0
+                            and batch_avg < content_threshold
+                            and _is_output_blank(batch_outs[0])
+                        )
+                        if truly_blank:
+                            if blank_attempt < MAX_BLANK_RETRY:
+                                self._log(
+                                    f"[ESRGAN]   Output blank, retry "
+                                    f"{blank_attempt+1}/{MAX_BLANK_RETRY} "
+                                    f"(avg={batch_avg/1024:.0f}KB)..."
+                                )
+                                import time as _time; _time.sleep(3)
+                                continue  # coba lagi
                             self._log(
                                 f"[ESRGAN] ✗ Batch {batch_idx+1} terdeteksi hitam/kosong "
                                 f"(avg={batch_avg/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB)"
                             )
                             _clean_output()
                             return _BLANK
+
+                        # Batch berhasil → keluar dari retry loop
+                        break
 
                     # Pindahkan output batch ke output_dir utama
                     for f in batch_outs:
