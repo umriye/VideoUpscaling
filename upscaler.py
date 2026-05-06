@@ -242,7 +242,13 @@ class Upscaler:
                 raise RuntimeError("Tidak ada frame yang diekstrak.")
 
             # 3. Jalankan Real-ESRGAN
-            self._log("[ESRGAN] Menjalankan AI upscaling...")
+            # Estimasi waktu: ~8-15 detik per frame pada GPU mid-range
+            est_min = max(1, int(total * 8 / 60))
+            est_max = max(2, int(total * 15 / 60))
+            self._log(
+                f"[ESRGAN] Menjalankan AI upscaling "
+                f"(estimasi {est_min}–{est_max} menit, harap tunggu)..."
+            )
             self._run_realesrgan(binary, frames_in, frames_out)
 
             # 4. Gabung frame → video sementara
@@ -282,25 +288,39 @@ class Upscaler:
         """
         Jalankan binary realesrgan-ncnn-vulkan pada folder frame.
         Urutan percobaan: GPU yang dikonfigurasi → GPU lain → llvmpipe (software renderer).
-        Tidak menggunakan -g -1 karena tidak didukung binary ini.
+        Setiap GPU dicoba dengan tile cascade: tile_size default → 256 → 128 jika blank.
+        llvmpipe selalu dimulai dari tile=256 untuk mencegah SIGSEGV (exit=-11).
         """
-        cfg     = REALESRGAN_CONFIG
-        model   = cfg.get("model_name", "realesrgan-x4plus")
-        scale   = str(cfg.get("scale", 4))
-        tile    = str(cfg.get("tile_size", 0))
-        use_gpu = cfg.get("use_gpu", True)
+        import re as _re
+        import tempfile as _tempfile
+
+        cfg      = REALESRGAN_CONFIG
+        model    = cfg.get("model_name", "realesrgan-x4plus")
+        scale    = str(cfg.get("scale", 4))
+        tile_cfg = str(cfg.get("tile_size", 0))
+        use_gpu  = cfg.get("use_gpu", True)
         pref_gpu = int(cfg.get("gpu_id", 1))
 
         # Cari folder models (model params)
-        model_dir = TOOLS_DIR / "models"  # default
+        model_dir = TOOLS_DIR / "models"
         for candidate in [Path(str(binary)).parent / "models", TOOLS_DIR / "models", TOOLS_DIR]:
             if candidate.exists() and any(candidate.glob("*.bin")):
                 model_dir = candidate
                 break
         logger.debug(f"Model dir: {model_dir}")
 
-        def _build_cmd(gpu_flag: str) -> list:
-            return [
+        # Hitung rata-rata ukuran frame INPUT untuk deteksi blank yang akurat
+        in_frames  = list(input_dir.glob("*.png"))
+        avg_in_size = (
+            sum(f.stat().st_size for f in in_frames) / len(in_frames)
+            if in_frames else 0
+        )
+        logger.debug(f"Avg input frame size: {avg_in_size/1024:.0f} KB")
+
+        # ── Helper functions ───────────────────────────────────────────────
+
+        def _build_cmd(gpu_flag: str, tile: str, low_mem: bool = False) -> list:
+            cmd = [
                 str(binary),
                 "-i", str(input_dir),
                 "-o", str(output_dir),
@@ -311,9 +331,12 @@ class Upscaler:
                 "-m", str(model_dir),
                 "-f", "png",
             ]
+            if low_mem:
+                # Kurangi thread untuk hemat memori (terutama llvmpipe)
+                cmd += ["-j", "1:1:1"]
+            return cmd
 
         def _has_gpu_error(stderr: str, stdout: str) -> bool:
-            """Deteksi kegagalan GPU dari output binary."""
             keywords = [
                 "vkqueuesubmit failed",
                 "vkcreatedevice failed",
@@ -325,98 +348,264 @@ class Upscaler:
             combined = (stderr + stdout).lower()
             return any(kw in combined for kw in keywords)
 
+        def _read_png_dims(path: Path) -> tuple[int, int] | None:
+            """
+            Baca dimensi PNG dari header (24 byte pertama) tanpa load seluruh file.
+            Format: signature(8) + IHDR_length(4) + 'IHDR'(4) + width(4) + height(4)
+            """
+            try:
+                import struct
+                with open(path, "rb") as f:
+                    header = f.read(24)
+                if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+                    return None
+                w = struct.unpack(">I", header[16:20])[0]
+                h = struct.unpack(">I", header[20:24])[0]
+                return w, h
+            except Exception:
+                return None
+
         def _output_ok(out_dir: Path) -> bool:
             """
-            Cek hasil frame ESRGAN valid (tidak kosong & tidak blank).
-            Frame 4x upscale nyata untuk video SD umumnya > 1MB per PNG.
+            Cek frame output valid menggunakan tiga kriteria:
+            1. Jumlah frame = jumlah input
+            2. Resolusi output = input × scale (cek via PNG header, cepat)
+            3. Ukuran file output cukup besar (bukan frame hitam/kosong)
+               Frame hitam 2880×1920 PNG ≈ <50KB; konten nyata >>100KB.
+            Fallback ke cek ukuran file jika pembacaan header gagal.
             """
-            frames = list(out_dir.glob("*.png"))
-            if not frames:
+            out_frames = list(out_dir.glob("*.png"))
+            if not out_frames:
                 return False
-            # File blank/hitam sangat kecil (< 256KB), real content biasanya > 1MB
-            avg_size = sum(f.stat().st_size for f in frames) / len(frames)
-            ok = avg_size > 256 * 1024  # > 256KB per frame
-            if not ok:
-                logger.debug(f"Output frame avg size {avg_size/1024:.0f}KB → dianggap blank")
-            return ok
+            # Jumlah frame harus sama dengan input
+            if len(out_frames) != len(in_frames):
+                logger.debug(
+                    f"Frame count mismatch: out={len(out_frames)}, in={len(in_frames)}"
+                )
+                return False
+
+            expected_scale = int(scale)  # biasanya 4
+
+            # Cek ukuran file output
+            avg_out = sum(f.stat().st_size for f in out_frames) / len(out_frames)
+
+            # Cek resolusi output menggunakan PNG header (sangat cepat, hanya baca 24 byte)
+            sample_out = out_frames[0]
+            out_dims = _read_png_dims(sample_out)
+            if out_dims:
+                out_w, out_h = out_dims
+                # Cek dimensi input juga
+                if in_frames:
+                    in_dims = _read_png_dims(in_frames[0])
+                    if in_dims:
+                        in_w, in_h = in_dims
+                        expected_w = in_w * expected_scale
+                        expected_h = in_h * expected_scale
+                        dim_ok = (out_w >= expected_w * 0.9) and (out_h >= expected_h * 0.9)
+                        if not dim_ok:
+                            self._log(
+                                f"[ESRGAN] ✗ Resolusi output {out_w}×{out_h} tidak sesuai "
+                                f"(harusnya ~{expected_w}×{expected_h}, model tidak berhasil diaplikasikan)"
+                            )
+                            return False
+
+                        # Dimensi OK — verifikasi konten bukan hitam/kosong.
+                        # Frame hitam 2880×1920 PNG ≈ 5–50 KB (sangat kompres).
+                        # Frame nyata 2880×1920 PNG >> ukuran frame input (720×480).
+                        # Threshold konservatif: max(100KB, 1.5× rata-rata ukuran frame input).
+                        content_threshold = max(100 * 1024, avg_in_size * 1.5)
+                        if avg_in_size > 0 and avg_out < content_threshold:
+                            self._log(
+                                f"[ESRGAN] ✗ Frame output terdeteksi hitam/kosong "
+                                f"(avg={avg_out/1024:.0f}KB, threshold={content_threshold/1024:.0f}KB) — "
+                                f"kemungkinan bug GPU/Vulkan, akan mencoba GPU/tile lain"
+                            )
+                            return False
+
+                        logger.debug(
+                            f"Resolusi output {out_w}×{out_h} ✓, "
+                            f"avg size {avg_out/1024:.0f}KB ✓"
+                        )
+                        return True
+
+            # Fallback: cek ukuran file jika header gagal dibaca
+            if avg_in_size > 0:
+                ok = avg_out > avg_in_size * 2.0
+                logger.debug(
+                    f"Frame size fallback: out={avg_out/1024:.0f}KB, "
+                    f"in={avg_in_size/1024:.0f}KB → {'OK' if ok else 'BLANK'}"
+                )
+                return ok
+            return avg_out > 64 * 1024
 
         def _clean_output():
             for f in output_dir.glob("*.png"):
                 f.unlink(missing_ok=True)
 
-        def _try_gpu(gpu_id: int, label: str) -> bool:
-            """Coba satu GPU. Return True jika berhasil."""
-            self._log(f"[ESRGAN] Mencoba {label}...")
-            cmd = _build_cmd(str(gpu_id))
+        # Return values untuk _try_gpu
+        _OK         = "ok"
+        _HARD_FAIL  = "hard_fail"   # Error Vulkan/GPU keras → jangan retry tile
+        _SIGSEGV    = "sigsegv"     # exit=-11, kemungkinan memory → coba tile lebih kecil
+        _BLANK      = "blank"       # Exit 0 tapi blank → retry dengan tile lebih kecil
+
+        def _try_gpu(gpu_id: int, label: str, tile: str, low_mem: bool = False) -> str:
+            """
+            Coba satu GPU dengan tile_size tertentu.
+            Returns: _OK | _HARD_FAIL | _SIGSEGV | _BLANK
+            """
+            mem_tag = " [low-mem]" if low_mem else ""
+            self._log(f"[ESRGAN] Mencoba {label} (tile={tile}{mem_tag})...")
+            cmd = _build_cmd(str(gpu_id), tile, low_mem=low_mem)
             logger.debug(f"CMD: {' '.join(cmd)}")
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            combined_out = proc.stderr + proc.stdout
+
+            # Gunakan Popen untuk menampilkan progress real-time (ESRGAN output "X.XX%")
+            proc_obj = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            stdout_lines: list[str] = []
+            last_pct = [-1]
+            try:
+                for line in proc_obj.stdout:  # type: ignore[union-attr]
+                    line = line.rstrip()
+                    stdout_lines.append(line)
+                    # Tampiilkan persentase kemajuan setiap 10%
+                    try:
+                        pct = int(float(line.strip().replace("%", "")))
+                        if pct != last_pct[0] and pct % 10 == 0:
+                            self._log(f"[ESRGAN]   {label}: {pct}%")
+                            last_pct[0] = pct
+                    except (ValueError, AttributeError):
+                        pass
+            except Exception:
+                pass
+            proc_obj.wait()
+
+            # Buat objek yang kompatibel dengan kode lama
+            all_output = "\n".join(stdout_lines)
+            _rc = proc_obj.returncode
+
+            class _ProcResult:
+                returncode = _rc
+                stderr = all_output
+                stdout = ""
+            proc = _ProcResult()
+
+            # SIGSEGV (exit=-11) → kemungkinan OOM, coba tile lebih kecil
+            if proc.returncode == -11:
+                self._log(f"[ESRGAN] ✗ {label} crash (SIGSEGV/OOM, tile={tile})")
+                _clean_output()
+                return _SIGSEGV
 
             if proc.returncode != 0 or _has_gpu_error(proc.stderr, proc.stdout):
-                reason = f"exit={proc.returncode}"
-                if _has_gpu_error(proc.stderr, proc.stdout):
-                    reason = "Vulkan/GPU error"
-                self._log(f"[ESRGAN] ✗ GPU {gpu_id} gagal ({reason})")
-                logger.debug(f"ESRGAN stderr (GPU {gpu_id}): {combined_out[-500:]}")
+                reason = (
+                    "Vulkan/GPU error"
+                    if _has_gpu_error(proc.stderr, proc.stdout)
+                    else f"exit={proc.returncode}"
+                )
+                self._log(f"[ESRGAN] ✗ {label} gagal ({reason})")
+                last_lines = [
+                    l for l in proc.stderr.strip().splitlines()
+                    if l.strip() and not l.startswith("[")
+                ]
+                if last_lines:
+                    logger.debug(f"  stderr: {last_lines[-1]}")
                 _clean_output()
-                return False
+                return _HARD_FAIL
 
             if not _output_ok(output_dir):
-                self._log(f"[ESRGAN] ✗ GPU {gpu_id} menghasilkan frame blank/kosong")
+                # _output_ok sudah log pesan detail; tambahkan ukuran file sebagai info tambahan
+                out_frames = list(output_dir.glob("*.png"))
+                if out_frames and not any("Resolusi output" in msg for msg in [""]):
+                    avg_out = sum(f.stat().st_size for f in out_frames) / len(out_frames)
+                    logger.debug(
+                        f"  avg output size: {avg_out/1024:.0f}KB "
+                        f"(threshold: {avg_in_size*2/1024:.0f}KB)"
+                    )
                 _clean_output()
-                return False
+                return _BLANK
 
-            self._log(f"[ESRGAN] ✓ Berhasil dengan {label} (GPU {gpu_id})")
-            return True
+            self._log(f"[ESRGAN] ✓ Berhasil dengan {label}")
+            return _OK
 
-        # ── Bangun urutan GPU yang akan dicoba ──────────────────────────────
-        # Deteksi GPU yang tersedia: jalankan binary dengan input dummy PNG → GPU list muncul di stderr
-        import re
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as _tf:
+        # ── Deteksi GPU yang tersedia ────────────────────────────────────────
+        with _tempfile.NamedTemporaryFile(suffix=".png", delete=False) as _tf:
             dummy_png = Path(_tf.name)
         detect_proc = subprocess.run(
             [str(binary), "-i", str(dummy_png), "-o", str(dummy_png)],
             capture_output=True, text=True
         )
-        combined_out = detect_proc.stderr + detect_proc.stdout
-        detected_ids = sorted(set(
-            int(m) for m in re.findall(r"^\[(\d+) ", combined_out, re.M)
+        try:
+            dummy_png.unlink(missing_ok=True)
+        except Exception:
+            pass
+        combined_out  = detect_proc.stderr + detect_proc.stdout
+        detected_ids  = sorted(set(
+            int(m) for m in _re.findall(r"^\[(\d+) ", combined_out, _re.M)
         ))
         if not detected_ids:
-            detected_ids = [0, 1, 2]  # default fallback
+            detected_ids = [0, 1, 2]
         logger.debug(f"GPU terdeteksi: {detected_ids}")
 
-        # Urutkan: GPU pilihan dulu, lalu sisanya, llvmpipe/software selalu terakhir
-        LLVMPIPE_ID = max(detected_ids)  # biasanya ID tertinggi = software renderer
+        # llvmpipe = ID tertinggi (software renderer)
+        LLVMPIPE_ID = max(detected_ids)
+
+        # Urutan: GPU pilihan → GPU hardware lain → llvmpipe
         preferred = [pref_gpu] if use_gpu else []
-        others = [g for g in detected_ids if g != pref_gpu and g != LLVMPIPE_ID]
+        others    = [g for g in detected_ids if g != pref_gpu and g != LLVMPIPE_ID]
         gpu_order = preferred + others + [LLVMPIPE_ID]
-        # Hapus duplikat sambil pertahankan urutan
         seen = set()
         gpu_order = [g for g in gpu_order if not (g in seen or seen.add(g))]
 
-        labels = {LLVMPIPE_ID: "llvmpipe/CPU"}
         logger.debug(f"Urutan GPU yang akan dicoba: {gpu_order}")
 
-        # ── Coba GPU satu per satu ──────────────────────────────────────────
-        for gid in gpu_order:
-            label = labels.get(gid, f"GPU {gid}")
-            if _try_gpu(gid, label):
-                return  # Berhasil
+        # ── Tile size cascade per GPU ─────────────────────────────────────────
+        # tile_cfg=0 (auto): coba 0 → 256 → 128 jika blank/sigsegv
+        # tile_cfg!=0: coba nilai user saja (tanpa cascade)
+        # llvmpipe: mulai dari 256 (hindari SIGSEGV dengan tile=0), pakai low_mem=True
+        hw_tiles = (
+            [tile_cfg, "256", "128"] if tile_cfg == "0" else [tile_cfg]
+        )
+        sw_tiles = ["256", "128", "64"]  # llvmpipe: mulai kecil, turun terus jika crash
 
-        # Semua GPU gagal
+        # ── Coba GPU satu per satu dengan cascade tile ────────────────────────
+        for gid in gpu_order:
+            is_software = gid == LLVMPIPE_ID
+            label       = "llvmpipe/CPU" if is_software else f"GPU {gid}"
+            tile_list   = sw_tiles if is_software else hw_tiles
+
+            for tile in tile_list:
+                result = _try_gpu(gid, label, tile, low_mem=is_software)
+                if result == _OK:
+                    return  # Berhasil
+                if result == _HARD_FAIL:
+                    break   # Error keras (Vulkan/GPU error) → skip ke GPU berikutnya
+                # _BLANK atau _SIGSEGV → lanjut ke tile lebih kecil
+                if tile != tile_list[-1]:
+                    self._log(
+                        f"[ESRGAN] Mencoba ulang {label} dengan tile_size lebih kecil..."
+                    )
+
+        # Semua GPU & tile gagal
         raise RuntimeError(
             f"realesrgan-ncnn-vulkan gagal di semua GPU ({gpu_order}). "
-            "Coba kurangi tile_size (misal 256) atau periksa driver Vulkan."
+            "Periksa driver Vulkan atau coba set tile_size=128 di config.py."
         )
 
     def _extract_frames(self, video: Path, output_dir: Path) -> None:
-        """Ekstrak semua frame dari video."""
+        """
+        Ekstrak semua frame dari video sebagai PNG RGB24 standar.
+        `-pix_fmt rgb24` penting untuk kompatibilitas ESRGAN — mencegah
+        output blank yang disebabkan oleh colorspace/alpha/bit-depth non-standar.
+        """
         cmd = [
             FFMPEG_PATH, "-y",
             "-i", str(video),
             "-q:v", "1",
+            "-pix_fmt", "rgb24",   # Paksa RGB 8-bit standar (wajib untuk ESRGAN)
             str(output_dir / "frame_%08d.png"),
         ]
         self._run_ffmpeg(cmd, "Ekstrak frame")
